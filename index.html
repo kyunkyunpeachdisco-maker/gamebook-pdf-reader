@@ -669,6 +669,14 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
   <label class="cs-radio" data-provider="anthropic" onclick="selectAiProvider('anthropic')"><input type="radio" name="aiProvider" value="anthropic"><span class="cs-radio-label">Anthropic Claude <span class="cs-radio-desc">有料APIキー</span></span></label>
 </div>
 <div style="font-family:'Jost',sans-serif;font-size:.72rem;color:var(--tx3);margin:2px 0 8px;line-height:1.5" id="apiKeyHelp"></div>
+<div id="geminiModelRow" style="margin:2px 0 10px">
+  <div style="font-family:'Jost',sans-serif;font-size:.72rem;color:var(--tx2);margin-bottom:4px">読み取りモデル</div>
+  <select class="preset-select" id="geminiModelSelect" onchange="saveGeminiModel(this.value)">
+    <option value="gemini-flash-latest">自動：最新Flash（gemini-flash-latest）</option>
+    <option value="gemini-3.5-flash">Gemini 3.5 Flash（現行の安定版）</option>
+    <option value="gemini-3-flash-preview">Gemini 3 Flash（Poe時代と同世代・preview）</option>
+  </select>
+</div>
 <input type="password" id="apiKeyInput" placeholder="APIキー" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--brd);background:var(--bg2);color:var(--tx);font-size:16px;margin-bottom:12px;box-sizing:border-box">
 <div style="display:flex;gap:8px">
   <button onclick="saveApiKey()" style="flex:1;padding:10px;border-radius:8px;border:none;background:var(--gold-d);color:#fff;font-family:'Jost',sans-serif;font-size:.9rem;cursor:pointer">保存</button>
@@ -1543,23 +1551,24 @@ function estimatePage(targetPara){
 function filterMonotonicOutliers(sorted){
   if(sorted.length<=2)return sorted;
 
-  // Use Longest Increasing Subsequence (LIS) on page values
+  // Use Longest Non-Decreasing Subsequence on page values
   // to find the largest set of points where para↑ implies page↑
+  // 1ページに複数パラグラフが載るのが普通なので、同一ページは「増加」として扱う
   var n=sorted.length;
   var pages=sorted.map(function(s){return s.page});
 
-  // Standard LIS algorithm (O(n log n))
+  // Standard LIS algorithm (O(n log n)), non-decreasing variant
   var tails=[]; // tails[i] = smallest tail value for IS of length i+1
   var tailIdx=[]; // index of each tail
   var prev=new Array(n).fill(-1);
 
   for(var i=0;i<n;i++){
     var val=pages[i];
-    // Binary search for leftmost tail >= val
+    // Binary search for leftmost tail > val (equal pages may continue the chain)
     var lo=0,hi=tails.length;
     while(lo<hi){
       var mid=(lo+hi)>>1;
-      if(tails[mid]<val)lo=mid+1;else hi=mid;
+      if(tails[mid]<=val)lo=mid+1;else hi=mid;
     }
     tails[lo]=val;
     tailIdx[lo]=i;
@@ -1575,6 +1584,37 @@ function filterMonotonicOutliers(sorted){
     k=prev[k];
   }
   return result;
+}
+
+// 外れ値フィルタ済みの既知データから、目標パラグラフを挟む下限・上限アンカーを返す
+function getKnownBracket(targetPara){
+  var allKnown=Object.entries(S.paraToPage).map(function(e){return{para:parseInt(e[0]),page:e[1]}});
+  allKnown.sort(function(a,b){return a.para-b.para});
+  var filtered=filterMonotonicOutliers(allKnown);
+  if(filtered.length>0)allKnown=filtered;
+  var low=null,high=null;
+  allKnown.forEach(function(k){
+    if(k.para<targetPara)low=k;
+    if(k.para>targetPara&&!high)high=k;
+  });
+  return{low:low,high:high};
+}
+
+// para→page の組が、その組自身を除いた既知データの単調性と矛盾しないか
+function mappingConsistent(para,page){
+  var pts=Object.entries(S.paraToPage).map(function(e){return{para:parseInt(e[0]),page:e[1]}})
+    .filter(function(k){return k.para!==para});
+  pts.sort(function(a,b){return a.para-b.para});
+  var f=filterMonotonicOutliers(pts);
+  if(f.length>0)pts=f;
+  var low=null,high=null;
+  pts.forEach(function(k){
+    if(k.para<para)low=k;
+    if(k.para>para&&!high)high=k;
+  });
+  if(low&&page<low.page)return false;
+  if(high&&page>high.page)return false;
+  return true;
 }
 
 /* --- Paragraph Search --- */
@@ -1669,7 +1709,17 @@ function canvasToBase64(canvas){
 }
 
 /* --- AI provider / API key management --- */
-var GEMINI_MODEL='gemini-flash-latest'; // Google公式の最新Flashエイリアス
+// Geminiモデル：自動エイリアスは裏で世代が切り替わるため、明示指定も選べるようにする
+var GEMINI_MODELS=['gemini-flash-latest','gemini-3.5-flash','gemini-3-flash-preview'];
+function getGeminiModel(){
+  var m=lsGet('gamebook-gemini-model');
+  return GEMINI_MODELS.indexOf(m)!==-1?m:'gemini-flash-latest';
+}
+function saveGeminiModel(m){
+  if(GEMINI_MODELS.indexOf(m)===-1)return;
+  lsSet('gamebook-gemini-model',m);
+  toast('読み取りモデルを変更しました','ok');
+}
 var PROVIDER_INFO={
   gemini:{keyName:'gamebook-gemini-api-key',placeholder:'AIza...',
     help:'<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" style="color:var(--gold)">Google AI Studio</a> で無料発行できます（クレジットカード不要）。無料枠: 数十回/分・千数百回/日程度。'},
@@ -1697,6 +1747,10 @@ function refreshApiKeyModal(){
     if(r)r.checked=sel;
   });
   document.getElementById('apiKeyHelp').innerHTML=PROVIDER_INFO[p].help;
+  var mRow=document.getElementById('geminiModelRow');
+  if(mRow)mRow.style.display=p==='gemini'?'':'none';
+  var mSel=document.getElementById('geminiModelSelect');
+  if(mSel)mSel.value=getGeminiModel();
   var inp=document.getElementById('apiKeyInput');
   inp.placeholder=PROVIDER_INFO[p].placeholder;
   inp.value=lsGet(PROVIDER_INFO[p].keyName)||'';
@@ -1767,7 +1821,7 @@ function callVisionAPI(prompt,base64Images){
   base64Images.forEach(function(b64){
     parts.push({inline_data:{mime_type:'image/png',data:b64}});
   });
-  return fetch('https://generativelanguage.googleapis.com/v1beta/models/'+GEMINI_MODEL+':generateContent',{
+  return fetch('https://generativelanguage.googleapis.com/v1beta/models/'+getGeminiModel()+':generateContent',{
     method:'POST',
     headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
     body:JSON.stringify({contents:[{parts:parts}]})
@@ -2099,34 +2153,20 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescan
   // Filter out already-scanned pages
   var newPages=thumbPages.filter(function(p){return!allScanned[p]});
 
-  // If all proposed pages already scanned, expand into unscanned territory
+  // If all proposed pages already scanned, expand into unscanned territory.
+  // 拡大は既知アンカーの括りの内側に限定し、推定位置に近いページから優先する
+  // （§261を探しているのに§300があるp.190より後ろへ進む、といった逆走を防ぐ）
   if(newPages.length===0&&retryCount>0){
-    var scannedKeys=Object.keys(allScanned).map(Number);
-    var minScanned=Math.min.apply(null,scannedKeys);
-    var maxScanned=Math.max.apply(null,scannedKeys);
-    // Simply expand outward from both edges of scanned range
-    // Direction is decided by the retry logic that called us
-    // (the center of thumbPages tells us which direction to go)
-    var proposedCenter=thumbPages.length>0?thumbPages[Math.floor(thumbPages.length/2)]:Math.round((minScanned+maxScanned)/2);
-    if(proposedCenter>=maxScanned){
-      // Expand forward (higher pages)
-      for(var ep=maxScanned+1;ep<=Math.min(S.numPages,maxScanned+12);ep++){
-        if(!allScanned[ep])newPages.push(ep);
-      }
-    }else if(proposedCenter<=minScanned){
-      // Expand backward (lower pages)
-      for(var ep2=Math.max(1,minScanned-12);ep2<minScanned;ep2++){
-        if(!allScanned[ep2])newPages.push(ep2);
-      }
-    }else{
-      // Expand in both directions
-      for(var ep3=maxScanned+1;ep3<=Math.min(S.numPages,maxScanned+6);ep3++){
-        if(!allScanned[ep3])newPages.push(ep3);
-      }
-      for(var ep4=Math.max(1,minScanned-6);ep4<minScanned;ep4++){
-        if(!allScanned[ep4])newPages.push(ep4);
-      }
+    var brk=getKnownBracket(num);
+    var brLo=brk.low?brk.low.page:1;
+    var brHi=brk.high?brk.high.page:S.numPages;
+    var target0=estimatePage(num)||Math.round((brLo+brHi)/2);
+    var cands=[];
+    for(var ep=brLo;ep<=brHi;ep++){
+      if(!allScanned[ep])cands.push(ep);
     }
+    cands.sort(function(a,b){return Math.abs(a-target0)-Math.abs(b-target0)});
+    newPages=cands.slice(0,12);
     if(newPages.length===0){
       aiArea.innerHTML='<div style="text-align:center;padding:6px;font-family:Jost,sans-serif;color:var(--tx3);font-size:.82rem">'+
         '<i class="fas fa-eye"></i> \u63a2\u7d22\u7bc4\u56f2\u3092\u5c3d\u304f\u3057\u307e\u3057\u305f\u3002\u30d8\u30c3\u30c0\u30fc\u3092\u76ee\u8996\u3067\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002</div>';
@@ -2343,12 +2383,18 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescan
                 rejectedParas.push({para:pn,page:r.page,reason:'implausible'});
                 return;
               }
-              // 既存の位置（ユーザー記録・学習済み）はAI読み取りで上書きしない
+              // 既存の位置（ユーザー記録・学習済み）はAI読み取りで原則上書きしない。
+              // ただし保存値が他の既知データと矛盾し、新しい読み取りは整合する場合のみ
+              // 過去の誤学習とみなして置き換える（自己修復）
               if(S.paraToPage[pn]===undefined){
                 S.paraToPage[pn]=r.page;
               }else if(S.paraToPage[pn]!==r.page){
-                rejectedParas.push({para:pn,page:r.page,reason:'conflict'});
-                return;
+                if(!mappingConsistent(pn,S.paraToPage[pn])&&mappingConsistent(pn,r.page)){
+                  S.paraToPage[pn]=r.page;
+                }else{
+                  rejectedParas.push({para:pn,page:r.page,reason:'conflict'});
+                  return;
+                }
               }
               discoveredParas.push({para:pn,page:r.page});
             });
@@ -2413,16 +2459,9 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescan
         // === TARGET NOT FOUND — decide whether to retry ===
         if(retryCount<maxRetries){
           // Use ALL global knowledge (S.paraToPage) to determine bracket, not just current round
-          var allKnown=Object.entries(S.paraToPage).map(function(e){return{para:parseInt(e[0]),page:e[1]}});
-          allKnown.sort(function(a,b){return a.para-b.para});
-          // 誤読が1件混ざると同じ誤った中心を回り続けるため、推定と同じ外れ値フィルタを通す
-          var filteredKnown=filterMonotonicOutliers(allKnown);
-          if(filteredKnown.length>0)allKnown=filteredKnown;
-          var globalLow=null,globalHigh=null;
-          allKnown.forEach(function(k){
-            if(k.para<num)globalLow=k;
-            if(k.para>num&&!globalHigh)globalHigh=k;
-          });
+          // （誤読の混入に備えて外れ値フィルタ済みのデータを使う）
+          var bracket=getKnownBracket(num);
+          var globalLow=bracket.low,globalHigh=bracket.high;
 
           var nextCenter=null;
           var dirText='';
@@ -2460,20 +2499,22 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescan
             '<i class="fas fa-eye" style="color:var(--gold)"></i> \u7bc4\u56f2\u5185\u306b\u00a7'+num+'\u304c\u898b\u3064\u304b\u3089\u305a ('+dirText+')<br>'+
             '<i class="fas fa-spinner fa-spin" style="color:var(--gold)"></i> \u6b21\u306e\u7bc4\u56f2\u3092\u63a2\u7d22\u4e2d...</div>';
 
-          // Build next batch
+          // Build next batch — 括りの外には対象が存在し得ないため、窓を括りの内側に制限する
+          var winLo=globalLow?globalLow.page:1;
+          var winHi=globalHigh?globalHigh.page:S.numPages;
           var newRange=8;
           var nextThumbPages=[];
           if(rescanGap){
             // Focus on interpolated center, not the entire bracket (which may be very wide)
             var rescanHalf=Math.min(newRange,Math.ceil((globalHigh.page-globalLow.page)/2));
-            var rescanStart=Math.max(1,nextCenter-rescanHalf);
-            var rescanEnd=Math.min(S.numPages,nextCenter+rescanHalf);
+            var rescanStart=Math.max(winLo,nextCenter-rescanHalf);
+            var rescanEnd=Math.min(winHi,nextCenter+rescanHalf);
             for(var pp=rescanStart;pp<=rescanEnd;pp++){
               nextThumbPages.push(pp);
               delete allScanned[pp]; // Allow re-scan of pages where OCR may have missed
             }
           }else{
-            for(var pp2=Math.max(1,nextCenter-newRange);pp2<=Math.min(S.numPages,nextCenter+newRange);pp2++){
+            for(var pp2=Math.max(winLo,nextCenter-newRange);pp2<=Math.min(winHi,nextCenter+newRange);pp2++){
               nextThumbPages.push(pp2);
             }
           }
