@@ -1755,7 +1755,7 @@ function callVisionAPI(prompt,base64Images){
       },
       body:JSON.stringify({
         model:'claude-sonnet-4-6',
-        max_tokens:1024,
+        max_tokens:4096,
         messages:[{role:'user',content:messageContent}]
       })
     }).then(function(res){return handleApiError(res,'anthropic')}).then(function(data){
@@ -2082,9 +2082,16 @@ function addTrailLog(type,text){
 // trajectory data. This means future searches benefit from accumulated knowledge
 // and eventually AI is not needed at all.
 
-function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
+var _aiSearchSeq=0; // 多重実行ガード：新しい検索が始まったら古いループは破棄する
+var _aiRetryFn=null;
+function aiSearchRetry(){if(_aiRetryFn)_aiRetryFn()}
+
+function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescanDone){
   retryCount=retryCount||0;
   allScanned=allScanned||{};
+  gapRescanDone=gapRescanDone||false;
+  if(retryCount===0)_aiSearchSeq++;
+  var seq=_aiSearchSeq;
   var maxRetries=3;
   var aiArea=document.getElementById('aiSearchArea');
   if(!aiArea)return;
@@ -2129,8 +2136,13 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
   }
   if(newPages.length===0)return;
 
-  // Mark pages as scanned
-  newPages.forEach(function(p){allScanned[p]=true});
+  // Limit batch size to avoid overwhelming the vision model
+  var maxImagesPerBatch=10;
+  var batchPages=newPages.slice(0,maxImagesPerBatch);
+
+  // Mark only pages actually sent to the AI as scanned
+  // (残りは未スキャンのまま残し、次ラウンドで拾う)
+  batchPages.forEach(function(p){allScanned[p]=true});
 
   // Show loading state
   var retryLabel=retryCount>0?' (\u63a2\u7d22'+(retryCount+1)+'\u56de\u76ee)':'';
@@ -2141,8 +2153,8 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
   // On retry, prepend new thumbnail cards to the existing strip (right-to-left)
   var strip=document.getElementById('headerStrip');
   if(strip&&retryCount>0){
-    // Sort newPages descending (右綴じ) for display
-    var displayPages=newPages.slice().sort(function(a,b){return b-a});
+    // Sort batchPages descending (右綴じ) for display
+    var displayPages=batchPages.slice().sort(function(a,b){return b-a});
     var sep=document.createElement('div');
     sep.style.cssText='flex-shrink:0;width:3px;background:var(--gold);margin:0 4px;border-radius:2px;align-self:stretch;opacity:.4';
     strip.appendChild(sep);
@@ -2153,6 +2165,7 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
     strip.appendChild(batchLabel);
 
     displayPages.forEach(function(p){
+      if(strip.querySelector('.thumb-card[data-page="'+p+'"]'))return; // 再スキャン時の重複カードを防ぐ
       var card=document.createElement('div');
       card.className='thumb-card';card.dataset.page=p;card.dataset.num=num;
       card.style.cssText='flex-shrink:0;width:140px;cursor:pointer;border-radius:8px;overflow:hidden;border:2px solid var(--brd);background:var(--bg2);transition:border-color .2s,box-shadow .2s';
@@ -2180,10 +2193,6 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
     setTimeout(function(){strip.scrollLeft=strip.scrollWidth},200);
   }
 
-  // Limit batch size to avoid overwhelming the vision model
-  var maxImagesPerBatch=10;
-  var batchPages=newPages.slice(0,maxImagesPerBatch);
-
   // Render header crops for AI at higher resolution, with page number burned in
   // Send ALL pages to AI (blank detection is only used for UI in showSearchResults)
   var cropPromises=batchPages.map(function(p){
@@ -2197,6 +2206,7 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
   });
 
   Promise.all(cropPromises).then(function(results){
+    if(seq!==_aiSearchSeq)return; // 新しい検索が始まっていたら破棄
     var files=[],pageList=[],base64Images=[];
     results.forEach(function(r){if(r){files.push(r.file);pageList.push(r.page);base64Images.push(r.base64)}});
     if(files.length===0){
@@ -2251,6 +2261,7 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
     }
 
     callVisionAPI(prompt,base64Images).then(function(content){
+      if(seq!==_aiSearchSeq)return; // 新しい検索が始まっていたら破棄
       var area2=document.getElementById('aiSearchArea');
       if(!area2)return;
       if(!content){
@@ -2328,12 +2339,18 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
 
             // Level 2: Individual plausibility check
             nums.forEach(function(pn){
-              if(isPlausibleMapping(pn,r.page)){
-                S.paraToPage[pn]=r.page;
-                discoveredParas.push({para:pn,page:r.page});
-              }else{
+              if(!isPlausibleMapping(pn,r.page)){
                 rejectedParas.push({para:pn,page:r.page,reason:'implausible'});
+                return;
               }
+              // 既存の位置（ユーザー記録・学習済み）はAI読み取りで上書きしない
+              if(S.paraToPage[pn]===undefined){
+                S.paraToPage[pn]=r.page;
+              }else if(S.paraToPage[pn]!==r.page){
+                rejectedParas.push({para:pn,page:r.page,reason:'conflict'});
+                return;
+              }
+              discoveredParas.push({para:pn,page:r.page});
             });
           });
         }
@@ -2398,6 +2415,9 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
           // Use ALL global knowledge (S.paraToPage) to determine bracket, not just current round
           var allKnown=Object.entries(S.paraToPage).map(function(e){return{para:parseInt(e[0]),page:e[1]}});
           allKnown.sort(function(a,b){return a.para-b.para});
+          // 誤読が1件混ざると同じ誤った中心を回り続けるため、推定と同じ外れ値フィルタを通す
+          var filteredKnown=filterMonotonicOutliers(allKnown);
+          if(filteredKnown.length>0)allKnown=filteredKnown;
           var globalLow=null,globalHigh=null;
           allKnown.forEach(function(k){
             if(k.para<num)globalLow=k;
@@ -2416,7 +2436,7 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
             var r2=(num-globalLow.para)/(globalHigh.para-globalLow.para);
             nextCenter=Math.round(gapLow+r2*(gapHigh-gapLow));
             dirText='\u00a7'+globalLow.para+'(p.'+gapLow+')\u301c\u00a7'+globalHigh.para+'(p.'+gapHigh+')\u306e\u9593\u3092\u518d\u63a2\u7d22';
-            rescanGap=true;
+            rescanGap=!gapRescanDone; // 同じ区間の再スキャンは1回まで（以降は未スキャンページへ）
           }else if(globalLow){
             // Only lower bound known → go higher
             dirText='\u00a7'+globalLow.para+'\u307e\u3067\u78ba\u8a8d (p.'+globalLow.page+') \u2192 \u3055\u3089\u306b\u5148\u3078';
@@ -2459,7 +2479,8 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
           }
 
           setTimeout(function(){
-            doAIVisionSearch(num,nextCenter,nextThumbPages,retryCount+1,allScanned);
+            if(seq!==_aiSearchSeq)return;
+            doAIVisionSearch(num,nextCenter,nextThumbPages,retryCount+1,allScanned,gapRescanDone||rescanGap);
           },500);
           return;
         }
@@ -2470,11 +2491,20 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned){
           '<i class="fas fa-eye"></i> '+(retryCount+1)+'\u56de\u63a2\u7d22 ('+totalScanned2+'\u30da\u30fc\u30b8) \u3057\u307e\u3057\u305f\u304c\u00a7'+num+'\u306f\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3067\u3057\u305f\u3002</div>';
         showAILearnedSummary(area2);
       }catch(e2){
-        area2.innerHTML='<div style="text-align:center;padding:6px;font-family:Jost,sans-serif;color:var(--tx3);font-size:.78rem"><i class="fas fa-eye"></i> AI応答: '+escHtml(content.substring(0,200))+'</div>';
+        // 失敗したバッチは未スキャンに戻し、同じラウンドを再試行できるようにする
+        batchPages.forEach(function(p){delete allScanned[p]});
+        _aiRetryFn=function(){doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescanDone)};
+        area2.innerHTML='<div style="text-align:center;padding:6px;font-family:Jost,sans-serif;color:var(--tx3);font-size:.78rem"><i class="fas fa-eye"></i> AI応答を解析できませんでした: '+escHtml(content.substring(0,120))+'</div>'+
+          '<button class="d-btn" style="width:100%;font-size:.82rem;padding:8px;margin-top:6px" onclick="aiSearchRetry()"><i class="fas fa-rotate-right"></i> 再試行</button>';
       }
     }).catch(function(err){
+      if(seq!==_aiSearchSeq)return;
       var area3=document.getElementById('aiSearchArea');
-      if(area3)area3.innerHTML='<div style="text-align:center;padding:6px;color:var(--red);font-family:Jost,sans-serif;font-size:.82rem;white-space:pre-line">'+escHtml(String(err&&err.message||err))+'</div>';
+      if(!area3)return;
+      batchPages.forEach(function(p){delete allScanned[p]});
+      _aiRetryFn=function(){doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescanDone)};
+      area3.innerHTML='<div style="text-align:center;padding:6px;color:var(--red);font-family:Jost,sans-serif;font-size:.82rem;white-space:pre-line">'+escHtml(String(err&&err.message||err))+'</div>'+
+        '<button class="d-btn" style="width:100%;font-size:.82rem;padding:8px;margin-top:6px" onclick="aiSearchRetry()"><i class="fas fa-rotate-right"></i> 再試行</button>';
     });
   });
 }
