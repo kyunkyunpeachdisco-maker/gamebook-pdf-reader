@@ -36,6 +36,7 @@ html:not(.dark){
   --brd:#cfc3a8;--brd-g:rgba(122,90,16,.15);--sh:rgba(0,0,0,.1);
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+*{touch-action:manipulation} /* touch-actionは継承されないため全要素に。ダブルタップズームのみ無効（ピンチ・スクロールは可） */
 html{font-size:16px;position:fixed;width:100%;height:100%;overflow:hidden;touch-action:manipulation;-webkit-text-size-adjust:100%}
 body{font-family:'Shippori Mincho B1',serif;background:var(--bg-deep);color:var(--tx);height:100%;overflow:hidden;display:flex;flex-direction:column;overscroll-behavior:none}
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}
@@ -665,6 +666,11 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 <div class="mo" id="loadModal"><div class="md" style="max-width:400px"><button class="md-x" onclick="closeModal('loadModal')">&times;</button><div class="md-t"><i class="fas fa-shuffle"></i> ブランチ切替</div><div id="loadContent"></div></div></div>
 <div class="mo" id="apiKeyModal"><div class="md" style="max-width:420px"><button class="md-x" onclick="closeModal('apiKeyModal')">&times;</button><div class="md-t"><i class="fas fa-key"></i> AI検索の設定</div>
 <div style="font-family:'Jost',sans-serif;font-size:.75rem;color:var(--tx2);margin-bottom:10px;line-height:1.6">AI検索（ヘッダー画像からのパラグラフ位置特定）にのみ使用します。<b>設定しなくても手動検索で遊べます。</b>キーはこの端末のブラウザ内にのみ保存されます。</div>
+<div style="font-family:'Jost',sans-serif;font-size:.72rem;color:var(--tx2);margin-bottom:4px">読み取りエンジン</div>
+<div class="cs-option-group" id="readModeGroup" style="margin-bottom:10px">
+  <label class="cs-radio" data-mode="ai" onclick="selectReadMode('ai')"><input type="radio" name="readMode" value="ai"><span class="cs-radio-label">AI優先 <span class="cs-radio-desc">OCRはAI失敗時の控え（既定）</span></span></label>
+  <label class="cs-radio" data-mode="ocr" onclick="selectReadMode('ocr')"><input type="radio" name="readMode" value="ocr"><span class="cs-radio-label">端末内OCR優先 <span class="cs-radio-desc">無料・APIキー不要（試験用）</span></span></label>
+</div>
 <div class="cs-option-group" id="aiProviderGroup">
   <label class="cs-radio" data-provider="gemini" onclick="selectAiProvider('gemini')"><input type="radio" name="aiProvider" value="gemini"><span class="cs-radio-label">Google Gemini <span class="cs-radio-desc">無料枠あり（推奨）</span></span></label>
   <label class="cs-radio" data-provider="anthropic" onclick="selectAiProvider('anthropic')"><input type="radio" name="aiProvider" value="anthropic"><span class="cs-radio-label">Anthropic Claude <span class="cs-radio-desc">有料APIキー</span></span></label>
@@ -1749,12 +1755,26 @@ function getAiProvider(){
 function getAiApiKey(){
   return lsGet(PROVIDER_INFO[getAiProvider()].keyName)||'';
 }
+function getReadMode(){
+  return lsGet('gamebook-read-mode')==='ocr'?'ocr':'ai';
+}
+function selectReadMode(m){
+  lsSet('gamebook-read-mode',m==='ocr'?'ocr':'ai');
+  refreshApiKeyModal();
+}
 function selectAiProvider(p){
   if(!PROVIDER_INFO[p])return;
   lsSet('gamebook-ai-provider',p);
   refreshApiKeyModal();
 }
 function refreshApiKeyModal(){
+  var rm=getReadMode();
+  document.querySelectorAll('#readModeGroup .cs-radio').forEach(function(el){
+    var sel=el.dataset.mode===rm;
+    el.classList.toggle('selected',sel);
+    var rr=el.querySelector('input[type=radio]');
+    if(rr)rr.checked=sel;
+  });
   var p=getAiProvider();
   document.querySelectorAll('#aiProviderGroup .cs-radio').forEach(function(el){
     var sel=el.dataset.provider===p;
@@ -1954,6 +1974,7 @@ function showSearchResults(num,candidates,estPage){
   var aiLabel=S.publisher==='sodosha'?'AI\u3067\u5de6\u7aef\u30a4\u30f3\u30c7\u30c3\u30af\u30b9\u3092\u8aad\u307f\u53d6\u308b':
                S.publisher==='tokyosogensha'?'AI\u3067\u53f3\u4e0b\u30a4\u30f3\u30c7\u30c3\u30af\u30b9\u3092\u8aad\u307f\u53d6\u308b':
                'AI\u3067\u30d8\u30c3\u30c0\u30fc\u3092\u8aad\u307f\u53d6\u308b';
+  if(getReadMode()==='ocr')aiLabel=aiLabel.replace('AI','OCR');
   html+='<div id="aiSearchArea" style="margin-bottom:10px">'+
     '<button class="d-btn" style="width:100%;font-size:.82rem;padding:8px" onclick="triggerAISearch()">'+
     '<i class="fas fa-eye"></i> '+aiLabel+'</button></div>';
@@ -2156,6 +2177,63 @@ var _aiSearchSeq=0; // 多重実行ガード：新しい検索が始まったら
 var _aiRetryFn=null;
 function aiSearchRetry(){if(_aiRetryFn)_aiRetryFn()}
 
+/* --- 端末内OCRフォールバック（Tesseract.js） ---
+   AIが使えない時（キー未設定・APIエラー）に、AIと同じヘッダークロップ画像を
+   数字ホワイトリスト付きOCRで読む。ライブラリは初回使用時に遅延ロード */
+var _ocrWorkerPromise=null;
+function getOcrWorker(){
+  if(_ocrWorkerPromise)return _ocrWorkerPromise;
+  _ocrWorkerPromise=new Promise(function(res,rej){
+    if(window.Tesseract)return res();
+    var s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+    s.onload=function(){res()};
+    s.onerror=function(){rej(new Error('OCRライブラリを読み込めませんでした'))};
+    document.head.appendChild(s);
+  }).then(function(){
+    return Tesseract.createWorker('eng');
+  }).then(function(w){
+    return w.setParameters({
+      tessedit_char_whitelist:'0123456789-',
+      tessedit_pageseg_mode:'11'
+    }).then(function(){return w});
+  });
+  _ocrWorkerPromise.catch(function(){_ocrWorkerPromise=null}); // 失敗時は次回やり直せるように
+  return _ocrWorkerPromise;
+}
+function parseOcrNumbers(text){
+  // "339-340" のような範囲表記は展開する（誤読対策で展開幅は6まで）
+  var out=[];
+  var re=/(\d{1,3})(?:-(\d{1,3}))?/g,m;
+  while((m=re.exec(text))!==null){
+    var a=parseInt(m[1]),b=m[2]?parseInt(m[2]):null;
+    if(b!==null&&b>a&&b-a<=6){for(var k=a;k<=b;k++)if(out.indexOf(k)===-1)out.push(k)}
+    else{if(out.indexOf(a)===-1)out.push(a);if(b!==null&&out.indexOf(b)===-1)out.push(b)}
+  }
+  return out.filter(function(n){return n>=1&&n<=999});
+}
+// ページ群のヘッダークロップ（ページ番号の焼き込みなし）をOCRし、AI応答と同じJSON形式で返す
+function ocrReadPages(pages,targetNum){
+  return getOcrWorker().then(function(w){
+    var readings=[];
+    var chain=Promise.resolve();
+    pages.forEach(function(p){
+      chain=chain.then(function(){
+        return renderHeaderCrop(p,300).then(function(cv){
+          return w.recognize(cv);
+        }).then(function(r){
+          readings.push({page:p,paras:parseOcrNumbers(r.data.text)});
+        }).catch(function(){readings.push({page:p,paras:[]})});
+      });
+    });
+    return chain.then(function(){
+      var found=[];
+      readings.forEach(function(r){if(r.paras.indexOf(targetNum)!==-1)found.push(r.page)});
+      return JSON.stringify({found:found,readings:readings});
+    });
+  });
+}
+
 function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescanDone){
   retryCount=retryCount||0;
   allScanned=allScanned||{};
@@ -2309,14 +2387,8 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescan
       '{"found":[pages_with_target],"readings":[{"page":N,"paras":[num1,num2]},...]}';
 
 
-    if(!getAiApiKey()){
-      var area0=document.getElementById('aiSearchArea');
-      if(area0)area0.innerHTML='<div style="text-align:center;padding:6px;font-family:Jost,sans-serif;color:var(--red);font-size:.82rem"><i class="fas fa-key"></i> APIキーを設定してください</div>';
-      openApiKeyModal();
-      return;
-    }
-
-    callVisionAPI(prompt,base64Images).then(function(content){
+    // 読み取り結果（AI応答 or OCRのJSON）を処理する共通ハンドラ
+    var handleReadResult=function(content){
       if(seq!==_aiSearchSeq)return; // 新しい検索が始まっていたら破棄
       var area2=document.getElementById('aiSearchArea');
       if(!area2)return;
@@ -2554,14 +2626,46 @@ function doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescan
         area2.innerHTML='<div style="text-align:center;padding:6px;font-family:Jost,sans-serif;color:var(--tx3);font-size:.78rem"><i class="fas fa-eye"></i> AI応答を解析できませんでした: '+escHtml(content.substring(0,120))+'</div>'+
           '<button class="d-btn" style="width:100%;font-size:.82rem;padding:8px;margin-top:6px" onclick="aiSearchRetry()"><i class="fas fa-rotate-right"></i> 再試行</button>';
       }
-    }).catch(function(err){
-      if(seq!==_aiSearchSeq)return;
+    };
+
+    var showReadError=function(err){
       var area3=document.getElementById('aiSearchArea');
       if(!area3)return;
       batchPages.forEach(function(p){delete allScanned[p]});
       _aiRetryFn=function(){doAIVisionSearch(num,estPage,thumbPages,retryCount,allScanned,gapRescanDone)};
       area3.innerHTML='<div style="text-align:center;padding:6px;color:var(--red);font-family:Jost,sans-serif;font-size:.82rem;white-space:pre-line">'+escHtml(String(err&&err.message||err))+'</div>'+
         '<button class="d-btn" style="width:100%;font-size:.82rem;padding:8px;margin-top:6px" onclick="aiSearchRetry()"><i class="fas fa-rotate-right"></i> 再試行</button>';
+    };
+
+    // AIが使えない時のフォールバック：同じクロップを端末内OCRで読む
+    var ocrFallback=function(note){
+      var areaF=document.getElementById('aiSearchArea');
+      if(areaF)areaF.innerHTML='<div style="text-align:center;padding:8px;font-family:Jost,sans-serif;font-size:.82rem;color:var(--tx2)">'+
+        '<i class="fas fa-microchip" style="color:var(--gold)"></i> <i class="fas fa-spinner fa-spin" style="color:var(--gold)"></i> 端末内OCRで読み取り中...'+
+        (note?'<br><span style="font-size:.7rem;color:var(--tx3)">'+escHtml(note)+'</span>':'')+'</div>';
+      return ocrReadPages(batchPages,num).then(function(json){
+        handleReadResult(json);
+      });
+    };
+
+    // 端末内OCR優先モード：AIを呼ばずOCRで読む
+    if(getReadMode()==='ocr'){
+      ocrFallback('端末内OCR優先モード').catch(showReadError);
+      return;
+    }
+
+    if(!getAiApiKey()){
+      ocrFallback('APIキー未設定のため端末内OCRを使用します').catch(showReadError);
+      return;
+    }
+
+    callVisionAPI(prompt,base64Images).then(function(content){
+      handleReadResult(content);
+    }).catch(function(err){
+      if(seq!==_aiSearchSeq)return;
+      ocrFallback('AI呼び出しに失敗したため端末内OCRに切替（'+String(err&&err.message||err).substring(0,60)+'）').catch(function(){
+        showReadError(err);
+      });
     });
   });
 }
@@ -4893,17 +4997,34 @@ window.addEventListener('pagehide',autoSaveToLocal);
 (function(){
   var vv=window.visualViewport;
   if(!vv)return;
+  // ボトムバー内の入力にフォーカス中は、バーをキーボード上端まで持ち上げる
+  // （scrollTo(0,0)でiOSの自動スクロールを打ち消しているため、これがないと入力欄が隠れる）
+  function liftBbar(){
+    var bbar=document.querySelector('.bbar');
+    if(!bbar)return;
+    var ae=document.activeElement;
+    var kb=window.innerHeight-vv.height-vv.offsetTop;
+    if(kb>60&&ae&&bbar.contains(ae)){
+      bbar.style.transform='translateY(-'+kb+'px)';
+      bbar.style.boxShadow='0 -4px 16px var(--sh)';
+    }else{
+      bbar.style.transform='';
+      bbar.style.boxShadow='';
+    }
+  }
   // Reset any visual viewport offset caused by keyboard
   function pinViewport(){
     if(vv.offsetTop!==0||vv.offsetLeft!==0){
       window.scrollTo(0,0);
     }
+    liftBbar();
   }
   vv.addEventListener('scroll',pinViewport);
   vv.addEventListener('resize',pinViewport);
+  document.addEventListener('focusin',function(){setTimeout(liftBbar,300)}); // キーボード出現アニメ後
   // On focus out (keyboard closing), force reset after animation
   document.addEventListener('focusout',function(){
-    setTimeout(function(){window.scrollTo(0,0)},100);
+    setTimeout(function(){window.scrollTo(0,0);liftBbar()},100);
   });
 })();
 </script>
