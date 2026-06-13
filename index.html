@@ -528,6 +528,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
             <input type="file" id="importPdfInput" accept="application/pdf" style="display:none" onchange="importFromPdf(event)">
             <button class="game-btn danger" onclick="gameOver()"><i class="fas fa-skull"></i> ゲームオーバー <small style="opacity:.6;font-size:.65rem">（軌跡・能力値を保持）</small></button>
             <button class="game-btn" onclick="newAdventure()"><i class="fas fa-rotate-right"></i> 同じ本でやり直す <small style="opacity:.6;font-size:.65rem">（全リセット）</small></button>
+            <button class="game-btn" onclick="clearParaMappings()"><i class="fas fa-eraser"></i> ページ対応の学習を削除 <small style="opacity:.6;font-size:.65rem">（誤学習のリセット）</small></button>
             <button class="game-btn" onclick="returnToTopPage()"><i class="fas fa-book"></i> トップに戻る（本を変える）</button>
             <button class="game-btn" onclick="openPublisherModal()"><i class="fas fa-building-columns"></i> 出版社: <span id="pubLabel">社会思想社</span></button>
             <button class="game-btn" id="bookInfoBtn" style="display:none" onclick="openBookInfoModal()"><i class="fas fa-book-skull"></i> 作品・ルール</button>
@@ -1357,6 +1358,21 @@ function newAdventure(){
     updateCharUI();renderInv();updateTree();
     setGameMode(false);
     toast('\u65B0\u3057\u3044\u5192\u967A\u306E\u6E96\u5099\u304C\u3067\u304D\u307E\u3057\u305F','ok');
+  });
+}
+
+function clearParaMappings(){
+  var count=Object.keys(S.paraToPage).length;
+  if(count===0){toast('削除する学習データがありません','ok');return}
+  showConfirm('パラグラフとページの対応データ '+count+' 件をすべて削除しますか？\n（AI検索の学習をやり直せます。軌跡・能力値・持ち物・パラグラフリンクは消えません）').then(function(ok){
+    if(!ok)return;
+    S.paraToPage={};
+    refreshKnownMappingsDisplay();
+    // オートセーブにも即反映する。何も進行していない状態だとautoSaveToLocalが
+    // 書き込みをスキップし、古い学習データが復元されてしまうため明示的に消す
+    if(!S.gameStarted&&S.history.length===0){lsRemove(AUTOSAVE_KEY)}
+    else{autoSaveToLocal()}
+    toast('ページ対応の学習データを削除しました','ok');
   });
 }
 
@@ -2569,6 +2585,8 @@ function refreshKnownMappingsDisplay(){
     var first=mappings[0],last=mappings[mappings.length-1];
     el.textContent='\u65e2\u77e5: '+mappings.length+'\u4ef6 (\u00a7'+first[0]+'\u301cp.'+first[1]+' \u2026 \u00a7'+last[0]+'\u301cp.'+last[1]+')';
     el.style.display='';
+  }else{
+    el.style.display='none';
   }
 }
 
