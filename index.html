@@ -4511,7 +4511,59 @@ function importFromPdf(event){
   });
 }
 
+/* PDF埋め込み・オートセーブ由来のセーブデータは画面のHTMLやonclickに埋め込まれるため、型を絞って無害化する
+   （他人から受け取ったPDFに細工されたセーブが入っていても、スクリプトが動かないように） */
+function sanitizeSaveData(d){
+  if(!d||typeof d!=='object')return {};
+  var int=function(v){var n=parseInt(v,10);return isFinite(n)?n:0};
+  var intOrNull=function(v){return v==null?null:int(v)};
+  var para=function(v){return v==='END'?'END':(v==null?null:int(v))};
+  var txt=function(v){return String(v==null?'':v).replace(/[<>&"'`]/g,'')};
+  var word=function(v){return /^[\w\-]{1,40}$/.test(String(v))?String(v):null};
+  function node(n){
+    if(!n||typeof n!=='object')return null;
+    var o={para:para(n.para),page:intOrNull(n.page),note:String(n.note==null?'':n.note),
+      logs:(Array.isArray(n.logs)?n.logs:[]).map(function(l){return{type:l&&l.type==='combat'?'combat':'cmd',text:String(l&&l.text||'')}}),
+      links:(Array.isArray(n.links)?n.links:[]).map(int),
+      children:(Array.isArray(n.children)?n.children:[]).map(node).filter(Boolean)};
+    if(n.id!==undefined)o.id=int(n.id);
+    return o;
+  }
+  function state(s){
+    var o={};
+    for(var k in s)o[k]=s[k];
+    if(s.history!==undefined)o.history=(Array.isArray(s.history)?s.history:[]).map(node).filter(Boolean);
+    if(s.curNodeId!==undefined)o.curNodeId=intOrNull(s.curNodeId);
+    if(s._nodeCounter!==undefined)o._nodeCounter=int(s._nodeCounter);
+    if(s.curPara!==undefined)o.curPara=para(s.curPara);
+    if(s.curPage!==undefined)o.curPage=int(s.curPage);
+    if(s.paraToPage&&typeof s.paraToPage==='object'){o.paraToPage={};for(var p in s.paraToPage)o.paraToPage[int(p)]=int(s.paraToPage[p])}
+    if(s.paraLinks&&typeof s.paraLinks==='object'){o.paraLinks={};for(var q in s.paraLinks)o.paraLinks[int(q)]=(Array.isArray(s.paraLinks[q])?s.paraLinks[q]:[]).map(int)}
+    if(s.char&&typeof s.char==='object'){
+      var c={};
+      for(var ck in s.char){var v=s.char[ck];c[ck]=typeof v==='boolean'?v:(typeof v==='number'?v:(typeof v==='string'&&v!==''&&isFinite(v)?Number(v):v))}
+      ['superpower','potionType'].forEach(function(f){if(c[f]!=null)c[f]=word(c[f])});
+      c.spells=(Array.isArray(c.spells)?c.spells:[]).filter(function(x){return x&&typeof x==='object'}).map(function(x){
+        return{key:word(x.key)||'',name:String(x.name||''),icon:/^[a-z0-9\- ]{1,60}$/i.test(String(x.icon||''))?String(x.icon):'fas fa-star',uses:int(x.uses),recovery:word(x.recovery)};
+      });
+      ['skill','maxSkill','stamina','maxStamina','luck','maxLuck','provisions','gold','potionDoses','magicTotal'].forEach(function(f){if(c[f]!==undefined)c[f]=int(c[f])});
+      c.customStats=sanitizeCustomStats(c.customStats);
+      o.char=c;
+    }
+    if(s.inventory!==undefined)o.inventory=(Array.isArray(s.inventory)?s.inventory:[]).map(function(it){return typeof it==='string'?it:{name:String(it&&it.name||''),qty:Math.max(1,int(it&&it.qty))}});
+    if(s.diceHist!==undefined)o.diceHist=(Array.isArray(s.diceHist)?s.diceHist:[]).map(txt);
+    if(s.combatRules&&typeof s.combatRules==='object'){var r={};for(var rk in s.combatRules){var rv=s.combatRules[rk];r[rk]=typeof rv==='boolean'?rv:int(rv)}o.combatRules=r}
+    if(s.gamePreset!==undefined)o.gamePreset=word(s.gamePreset)||'standard';
+    if(s.name!==undefined)o.name=String(s.name);
+    if(s.date!==undefined)o.date=txt(s.date);
+    return o;
+  }
+  var out=state(d);
+  if(d.saves!==undefined)out.saves=(Array.isArray(d.saves)?d.saves:[]).filter(function(sv){return sv&&typeof sv==='object'}).map(state);
+  return out;
+}
 function restoreGameState(data){
+  data=sanitizeSaveData(data);
   if(data.history)S.history=data.history;
   if(data.curNodeId!==undefined)S.curNodeId=data.curNodeId;
   if(data._nodeCounter!==undefined)S._nodeCounter=data._nodeCounter;
